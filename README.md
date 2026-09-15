@@ -1,10 +1,21 @@
 # Hybrid Long-Context Attention
 
-An experimental PyTorch language-model layer for long-context research. It combines efficient local attention, a recurrent long-range state, retrieval over external documents, and source-grounded token copying.
+## Problem Statement:
+Modern AI language models often rely heavily on attention mechanisms to understand relationships between tokens. However, full attention becomes computationally expensive as the context length increases, while simpler recurrent or local-attention methods may struggle to retain and retrieve important information from distant parts of a document.
 
-> This is a research proof of concept, not a production LLM or a claim that the portable implementation outperforms Flash Attention.
+This creates a challenge: How can we build an AI architecture that processes long sequences efficiently while still understanding local relationships and accessing relevant distant information?
 
-## Architecture
+```
+## Our Solution:
+An experimental PyTorch language-model layer for long-context research. It combines efficient local attention, a recurrent long-range state, retrieval over external documents, and source-grounded token copying. In simple words an alternative to the Transformer Architecture's Full Attention Layers with more efficiency.
+
+Our idea is a fusion of multiple proved mechanisms(Mamba, Samba etc.) and borrows concepts from them. It is not exactly a novel architecture but a combination of them. This architecture efficiency levels assumably compatible with full attention.
+
+> Important Note: This is a research proof of concept. The test results given below do not explicitly guarantee that hybrid layer will outperform full attention. The results are based on our experiments. 
+
+```
+
+## Architecture:
 
 ```text
 Input text → GPT-2 tokenizer → token embeddings
@@ -155,7 +166,7 @@ vocabulary, this reduced copy-plus-output live allocation from about **2.08
 GiB to 116 MiB**, and backward peak from **3.65 GiB to 199 MiB**.
 
 With autograd disabled correctly during inference, the attention-only benchmark
-on the tested RTX 4050 produced:
+tested on a laptop with RTX 4050 produced:
 
 | Tokens | Full SDPA | Hybrid one-shot | Hybrid cached prefill |
 |---:|---:|---:|---:|
@@ -170,8 +181,8 @@ kernel-launch overhead further on Linux/WSL.
 
 ## Research status
 
-This repository is suitable as the foundation for a technical report,
-hackathon paper, or workshop/student-project submission. A defensible framing
+This repository is suitable as the foundation for a technical report or a research paper.
+ A defensible framing
 is a hybrid long-context architecture with contextual retrieval copying and
 memory-aware output/prefill optimizations.
 
@@ -186,6 +197,7 @@ The current evidence supports the following narrow claims:
 
 It does **not** yet establish general language-model quality or a universal
 speed advantage over Flash Attention.
+Further testing is still necessary to establish trusted claims.
 
 ## Optional fused linear-attention backend
 
@@ -195,14 +207,13 @@ speed advantage over Flash Attention.
 pip install 'flash-linear-attention[cuda]'
 python train_poc.py --state-backend fla --no-local-attention
 ```
-
-FLA is not currently usable from the native Windows environment used for this project because its required Triton runtime does not ship a compatible Windows wheel. The default `torch` state mixer is a portable correctness baseline; do not present it as Flash Attention-equivalent in throughput benchmarks.
+It is a fallback and not recommmeded.
+FLA is not currently usable from the native Windows environment used for this project because its required Triton runtime does not ship a compatible Windows wheel. The default `torch` state mixer is a portable correctness baseline.
 
 ## Limitations and next steps
 
 - The synthetic benchmark is small; it does not demonstrate general language modeling or broad retrieval quality.
 - The default state-scan fallback is `O(N log N)`, not a fused linear-time CUDA kernel.
-- Full attention is often faster at short and moderate sequence lengths due to optimized Flash Attention kernels.
 - Retrieval currently runs through CPU FAISS and Sentence Transformers; it is outside the GPU layer timing benchmark.
 - A rigorous long-context study should compare parameter-matched full, sliding-only, hybrid, and hybrid-plus-retrieval models across context lengths, corpora, random seeds, and equal training-token budgets.
 - A paper-quality evaluation needs larger standard long-context and retrieval
