@@ -5,7 +5,6 @@ Modern AI language models often rely heavily on attention mechanisms to understa
 
 This creates a challenge: How can we build an AI architecture that processes long sequences efficiently while still understanding local relationships and accessing relevant distant information?
 
-```
 ## Our Solution:
 An experimental PyTorch language-model layer for long-context research. It combines efficient local attention, a recurrent long-range state, retrieval over external documents, and source-grounded token copying. In simple words an alternative to the Transformer Architecture's Full Attention Layers with more efficiency.
 
@@ -13,7 +12,7 @@ Our idea is a fusion of multiple proved mechanisms(Mamba, Samba etc.) and borrow
 
 > Important Note: This is a research proof of concept. The test results given below do not explicitly guarantee that hybrid layer will outperform full attention. The results are based on our experiments. 
 
-```
+
 
 ## Architecture:
 
