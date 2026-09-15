@@ -9,7 +9,7 @@ from App import (
     SourceGroundedCopyHead,
     streaming_causal_prefill,
 )
-from mini_hybrid_lm import make_next_token_batch
+from mini_hybrid_lm import MiniHybridLM, make_next_token_batch
 
 
 def reference_attention(
@@ -199,6 +199,15 @@ def main() -> None:
         one_shot = prefill_layer(x, causal=True)
         streamed_prefill = streaming_causal_prefill(prefill_layer, x, chunk_size=7)
     torch.testing.assert_close(streamed_prefill, one_shot, atol=1e-5, rtol=1e-5)
+
+    model_prefill = MiniHybridLM(101, d_model=32, num_layers=1, window_size=8, num_heads=4, inference_prefill_chunk_size=8).eval()
+    model_one_shot = MiniHybridLM(101, d_model=32, num_layers=1, window_size=8, num_heads=4, inference_prefill_chunk_size=None).eval()
+    model_one_shot.load_state_dict(model_prefill.state_dict())
+    test_ids = torch.randint(0, 101, (1, 37))
+    with torch.inference_mode():
+        prefill_logits = model_prefill(test_ids)
+        one_shot_logits = model_one_shot(test_ids)
+    torch.testing.assert_close(prefill_logits, one_shot_logits, atol=1e-5, rtol=1e-5)
 
     retrieval = RetrievedEvidenceAttention(32, query_chunk_size=7).eval()
     shared_memory = torch.randn(2, 5, 32)

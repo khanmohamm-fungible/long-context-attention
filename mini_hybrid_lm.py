@@ -5,7 +5,7 @@ from dataclasses import dataclass
 import torch
 from torch import Tensor, nn
 
-from App import HybridLongContextLayer, RMSNorm, SourceGroundedCopyHead
+from App import HybridLongContextLayer, RMSNorm, SourceGroundedCopyHead, streaming_causal_prefill
 from source_bridge import ContextualSourceEncoder
 
 
@@ -21,6 +21,7 @@ class MiniHybridLM(nn.Module):
         num_heads: int = 4,
         state_backend: str = "torch",
         use_local_attention: bool = True,
+        inference_prefill_chunk_size: int | None = 4096,
     ) -> None:
         super().__init__()
         if vocab_size <= 0 or num_layers <= 0:
@@ -28,6 +29,9 @@ class MiniHybridLM(nn.Module):
         if d_model % num_heads:
             raise ValueError("d_model must be divisible by num_heads")
         self.embedding = nn.Embedding(vocab_size, d_model)
+        if inference_prefill_chunk_size is not None and inference_prefill_chunk_size <= 0:
+            raise ValueError("inference_prefill_chunk_size must be positive or None")
+        self.inference_prefill_chunk_size = inference_prefill_chunk_size
         self.layers = nn.ModuleList(
             HybridLongContextLayer(
                 d_model,
@@ -60,13 +64,31 @@ class MiniHybridLM(nn.Module):
     ) -> Tensor:
         x = self.embedding(input_ids)
         for layer in self.layers:
-            x = layer(
-                x,
-                causal=True,
-                token_mask=token_mask,
-                retrieved_memory=retrieved_memory,
-                retrieved_mask=retrieved_mask,
-            )
+            # Long inference prompts use exact cached prefill. It bounds the
+            # local-attention and portable recurrence workspaces to one 4K
+            # block, while training and short prompts retain the one-shot path.
+            if (
+                not self.training
+                and not torch.is_grad_enabled()
+                and self.inference_prefill_chunk_size is not None
+                and x.shape[1] > self.inference_prefill_chunk_size
+            ):
+                x = streaming_causal_prefill(
+                    layer,
+                    x,
+                    chunk_size=self.inference_prefill_chunk_size,
+                    token_mask=token_mask,
+                    retrieved_memory=retrieved_memory,
+                    retrieved_mask=retrieved_mask,
+                )
+            else:
+                x = layer(
+                    x,
+                    causal=True,
+                    token_mask=token_mask,
+                    retrieved_memory=retrieved_memory,
+                    retrieved_mask=retrieved_mask,
+                )
         hidden = self.final_norm(x)
         copy_inputs = (source_states, source_token_ids, source_mask)
         if any(item is not None for item in copy_inputs):

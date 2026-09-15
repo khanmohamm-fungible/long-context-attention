@@ -810,7 +810,7 @@ def streaming_causal_prefill(
     layer: HybridLongContextLayer,
     x: Tensor,
     *,
-    chunk_size: int = 512,
+    chunk_size: int = 4096,
     token_mask: Tensor | None = None,
     retrieved_memory: Tensor | None = None,
     retrieved_mask: Tensor | None = None,
