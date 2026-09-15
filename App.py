@@ -88,6 +88,28 @@ def _parallel_affine_scan(decay: Tensor, update: Tensor, initial_state: Tensor) 
     return states.to(update.dtype), states[:, -1].to(update.dtype)
 
 
+def _chunked_affine_scan(decay: Tensor, update: Tensor, initial_state: Tensor, chunk_size: int) -> tuple[Tensor, Tensor]:
+    """Exact bounded-memory scan for long inference prefills.
+
+    Each chunk is scanned in parallel and only chunk boundaries are processed
+    sequentially. This trades a small number of kernel launches for lower peak
+    memory than an all-sequence Hillis-Steele scan, whose intermediate tensors
+    scale with ``N log N``.
+    """
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be positive")
+    states: list[Tensor] = []
+    state = initial_state
+    for start in range(0, decay.shape[1], chunk_size):
+        block_states, state = _parallel_affine_scan(
+            decay[:, start:start + chunk_size],
+            update[:, start:start + chunk_size],
+            state,
+        )
+        states.append(block_states)
+    return torch.cat(states, dim=1), state
+
+
 def _affine_combine(left: tuple[Tensor, Tensor], right: tuple[Tensor, Tensor]) -> tuple[Tensor, Tensor]:
     """Associative composition of two affine recurrence segments.
 
@@ -133,12 +155,13 @@ def _naive_affine_scan(decay: Tensor, update: Tensor, initial_state: Tensor) -> 
 class ParallelGatedStateMixer(nn.Module):
     """Stable long-range mixer; bidirectional mode uses both sequence directions."""
 
-    def __init__(self, d_model: int, min_decay: float = 0.005, max_decay: float = 0.995, *, use_fused_scan: bool = False) -> None:
+    def __init__(self, d_model: int, min_decay: float = 0.005, max_decay: float = 0.995, *, use_fused_scan: bool = False, inference_chunk_size: int | None = None) -> None:
         super().__init__()
         if not 0.0 <= min_decay < max_decay < 1.0:
             raise ValueError("decays must satisfy 0 <= min < max < 1")
         self.min_decay, self.max_decay = min_decay, max_decay
         self.use_fused_scan = use_fused_scan
+        self.inference_chunk_size = inference_chunk_size
         self.decay_proj = nn.Linear(d_model, d_model)
         self.value_proj = nn.Linear(d_model, d_model)
         self.forward_out = nn.Linear(d_model, d_model, bias=False)
@@ -170,11 +193,17 @@ class ParallelGatedStateMixer(nn.Module):
             mask = token_mask.to(device=x.device, dtype=torch.bool).unsqueeze(-1)
             decay = torch.where(mask, decay, torch.ones_like(decay))
             update = torch.where(mask, update, torch.zeros_like(update))
-        scan = fused_affine_scan_inference if self.use_fused_scan else _parallel_affine_scan
-        forward_states, final_state = scan(decay, update, initial_state)
+        if self.use_fused_scan:
+            scan = fused_affine_scan_inference
+            forward_states, final_state = scan(decay, update, initial_state)
+        elif self.inference_chunk_size is not None and not self.training and not torch.is_grad_enabled():
+            forward_states, final_state = _chunked_affine_scan(decay, update, initial_state, self.inference_chunk_size)
+        else:
+            forward_states, final_state = _parallel_affine_scan(decay, update, initial_state)
         mixed = self.forward_out(forward_states)
         if bidirectional:
-            reverse_states, _ = scan(
+            reverse_scan = fused_affine_scan_inference if self.use_fused_scan else _parallel_affine_scan
+            reverse_states, _ = reverse_scan(
                 torch.flip(decay, (1,)), torch.flip(update, (1,)), x.new_zeros(batch, width)
             )
             mixed = mixed + self.backward_out(torch.flip(reverse_states, (1,)))
@@ -235,7 +264,7 @@ class FlashLinearStateMixer(nn.Module):
 class SlidingWindowAttention(nn.Module):
     """RoPE local attention with an exact causal KV-window cache."""
 
-    def __init__(self, d_model: int, num_heads: int, window_size: int, dropout: float) -> None:
+    def __init__(self, d_model: int, num_heads: int, window_size: int, dropout: float, *, attention_chunk_size: int = 256) -> None:
         super().__init__()
         if d_model % num_heads:
             raise ValueError("d_model must be divisible by num_heads")
@@ -245,6 +274,9 @@ class SlidingWindowAttention(nn.Module):
         if window_size <= 0:
             raise ValueError("window_size must be positive")
         self.window_size, self.dropout = window_size, dropout
+        if attention_chunk_size <= 0:
+            raise ValueError("attention_chunk_size must be positive")
+        self.attention_chunk_size = attention_chunk_size
         self.qkv, self.out = nn.Linear(d_model, 3 * d_model), nn.Linear(d_model, d_model)
         inv_freq = 1.0 / (10000 ** (torch.arange(0, self.head_dim, 2).float() / self.head_dim))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
@@ -347,7 +379,9 @@ class SlidingWindowAttention(nn.Module):
     ) -> Tensor:
         """Apply SDPA to bounded key ranges without constructing N x W windows."""
         tokens = q.shape[1]
-        chunk_size = min(tokens, max(16, min(self.window_size, 256)))
+        # Larger chunks reduce Python/SDPA launch overhead. They are bounded to
+        # keep the temporary local mask subquadratic in the sequence length.
+        chunk_size = min(tokens, self.attention_chunk_size)
         attended = torch.empty_like(q)
         dropout_p = self.dropout if self.training else 0.0
 
@@ -390,6 +424,7 @@ class SlidingWindowAttention(nn.Module):
         position_ids: Tensor | None,
         kv_cache: LocalKVCache | None = None,
         token_mask: Tensor | None = None,
+        build_kv_cache: bool = True,
     ) -> tuple[Tensor, LocalKVCache | None]:
         batch, tokens, width = x.shape
         if tokens == 0:
@@ -457,12 +492,7 @@ class SlidingWindowAttention(nn.Module):
                 last_valid_position + 1,
                 previous_position,
             )
-            next_cache = self._compact_cache(
-                all_k,
-                all_v,
-                all_valid,
-                next_position,
-            )
+            next_cache = self._compact_cache(all_k, all_v, all_valid, next_position) if build_kv_cache else None
             return output, next_cache
         left, right = self.window_size // 2, self.window_size - self.window_size // 2 - 1
         attended = self._attend(
@@ -680,7 +710,7 @@ class HybridLongContextLayer(nn.Module):
     to avoid replicating it for every query.
     """
 
-    def __init__(self, d_model: int, window_size: int = 128, *, num_heads: int = 8, dropout: float = 0.0, mlp_ratio: int = 4, use_fused_scan: bool = False, state_backend: str = "torch", use_local_attention: bool = True) -> None:
+    def __init__(self, d_model: int, window_size: int = 128, *, num_heads: int = 8, dropout: float = 0.0, mlp_ratio: int = 4, use_fused_scan: bool = False, state_backend: str = "torch", use_local_attention: bool = True, attention_chunk_size: int = 256, state_inference_chunk_size: int | None = None) -> None:
         super().__init__()
         if d_model <= 0 or mlp_ratio <= 0:
             raise ValueError("d_model and mlp_ratio must be positive")
@@ -690,9 +720,9 @@ class HybridLongContextLayer(nn.Module):
         self.state_backend, self.use_local_attention = state_backend, use_local_attention
         self.local_norm, self.state_norm = RMSNorm(d_model), RMSNorm(d_model)
         self.retrieval_norm, self.mlp_norm = RMSNorm(d_model), RMSNorm(d_model)
-        self.local_attention = SlidingWindowAttention(d_model, num_heads, window_size, dropout)
+        self.local_attention = SlidingWindowAttention(d_model, num_heads, window_size, dropout, attention_chunk_size=attention_chunk_size)
         self.state_mixer = (
-            ParallelGatedStateMixer(d_model, use_fused_scan=use_fused_scan)
+            ParallelGatedStateMixer(d_model, use_fused_scan=use_fused_scan, inference_chunk_size=state_inference_chunk_size)
             if state_backend == "torch"
             else FlashLinearStateMixer(d_model, num_heads)
         )
@@ -731,6 +761,7 @@ class HybridLongContextLayer(nn.Module):
                 position_ids=position_ids,
                 kv_cache=kv_cache,
                 token_mask=token_mask,
+                build_kv_cache=return_cache or kv_cache is not None or cache is not None,
             )
             x = x + local
         else:
@@ -773,6 +804,45 @@ def compile_for_inference(model: nn.Module, *, dynamic: bool = False) -> nn.Modu
     if not hasattr(torch, "compile"):
         raise RuntimeError("compile_for_inference requires PyTorch 2.0 or newer")
     return torch.compile(model, dynamic=dynamic)
+
+
+def streaming_causal_prefill(
+    layer: HybridLongContextLayer,
+    x: Tensor,
+    *,
+    chunk_size: int = 512,
+    token_mask: Tensor | None = None,
+    retrieved_memory: Tensor | None = None,
+    retrieved_mask: Tensor | None = None,
+) -> Tensor:
+    """Exact bounded-VRAM causal prefill using the layer's existing cache.
+
+    Unlike a one-shot prefill, no recurrence scan or local-attention temporary
+    spans the entire prompt. Only a chunk plus the fixed-size local KV window
+    is live at a time; the recurrent state is carried in ``HybridCache``.
+    This is intended for inference only and preserves the result of a causal
+    full-sequence call (up to normal floating-point tolerance).
+    """
+    if layer.training or torch.is_grad_enabled():
+        raise RuntimeError("streaming_causal_prefill is inference-only; call under torch.inference_mode()")
+    if x.ndim != 3 or chunk_size <= 0:
+        raise ValueError("x must be [batch, tokens, d_model] and chunk_size must be positive")
+    outputs: list[Tensor] = []
+    cache: HybridCache | None = None
+    for start in range(0, x.shape[1], chunk_size):
+        end = min(start + chunk_size, x.shape[1])
+        current_mask = None if token_mask is None else token_mask[:, start:end]
+        output, cache = layer(
+            x[:, start:end],
+            causal=True,
+            token_mask=current_mask,
+            retrieved_memory=retrieved_memory,
+            retrieved_mask=retrieved_mask,
+            cache=cache,
+            return_cache=True,
+        )
+        outputs.append(output)
+    return torch.cat(outputs, dim=1) if outputs else x
 
 
 def _smoke_test() -> None:

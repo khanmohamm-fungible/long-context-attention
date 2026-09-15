@@ -56,6 +56,7 @@ class MiniHybridLM(nn.Module):
         source_mask: Tensor | None = None,
         source_positions: Tensor | None = None,
         source_document_ids: Tensor | None = None,
+        output_positions: Tensor | None = None,
     ) -> Tensor:
         x = self.embedding(input_ids)
         for layer in self.layers:
@@ -75,7 +76,11 @@ class MiniHybridLM(nn.Module):
                 raise ValueError("source_positions and source_document_ids must be supplied together")
             if source_positions is not None:
                 source_states = self.source_encoder(source_states, source_mask, source_positions, source_document_ids)
-            return self.copy_head(hidden, source_states, source_token_ids, source_mask)
+            return self.copy_head(hidden, source_states, source_token_ids, source_mask, output_positions=output_positions)
+        if output_positions is not None:
+            output_positions = output_positions.to(device=hidden.device, dtype=torch.long)
+            output_positions = torch.where(output_positions < 0, output_positions + hidden.shape[1], output_positions)
+            hidden = hidden.index_select(1, output_positions)
         return self.lm_head(hidden)
 
 

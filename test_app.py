@@ -3,9 +3,11 @@ import torch.nn.functional as F
 
 from App import (
     HybridLongContextLayer,
+    ParallelGatedStateMixer,
     RetrievedEvidenceAttention,
     SlidingWindowAttention,
     SourceGroundedCopyHead,
+    streaming_causal_prefill,
 )
 from mini_hybrid_lm import make_next_token_batch
 
@@ -181,6 +183,22 @@ def main() -> None:
         shared_source_mask[:, None].expand(-1, x.shape[1], -1),
     )
     torch.testing.assert_close(shared_logits, expanded_shared_logits)
+
+    # Chunked inference scan must be numerically identical to the full scan.
+    scan_reference = ParallelGatedStateMixer(32).eval()
+    scan_chunked = ParallelGatedStateMixer(32, inference_chunk_size=8).eval()
+    scan_chunked.load_state_dict(scan_reference.state_dict())
+    with torch.inference_mode():
+        reference_states, reference_last = scan_reference(x, bidirectional=False, initial_state=None)
+        chunked_states, chunked_last = scan_chunked(x, bidirectional=False, initial_state=None)
+    torch.testing.assert_close(chunked_states, reference_states, atol=1e-6, rtol=1e-5)
+    torch.testing.assert_close(chunked_last, reference_last, atol=1e-6, rtol=1e-5)
+
+    prefill_layer = HybridLongContextLayer(32, window_size=8, num_heads=4).eval()
+    with torch.inference_mode():
+        one_shot = prefill_layer(x, causal=True)
+        streamed_prefill = streaming_causal_prefill(prefill_layer, x, chunk_size=7)
+    torch.testing.assert_close(streamed_prefill, one_shot, atol=1e-5, rtol=1e-5)
 
     retrieval = RetrievedEvidenceAttention(32, query_chunk_size=7).eval()
     shared_memory = torch.randn(2, 5, 32)

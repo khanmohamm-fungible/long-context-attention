@@ -104,9 +104,28 @@ Compare local attention, full PyTorch SDPA, and the complete hybrid layer:
 ```powershell
 .\.venv\Scripts\python.exe benchmark_attention.py --tokens 1024 2048 4096 8192
 .\.venv\Scripts\python.exe benchmark_attention.py --training --tokens 4096 8192
+.\.venv\Scripts\python.exe benchmark_attention.py --tokens 8192 16384 --attention-chunk-size 512
 ```
 
 The benchmark uses synchronized CUDA timing and `torch.cuda.max_memory_allocated`, reporting GPU latency and allocated VRAM rather than CPU RSS. PyTorch SDPA may select Flash Attention on supported hardware.
+
+Profile every hybrid stage and run retrieval/copy ablations:
+
+```powershell
+.\.venv\Scripts\python.exe profile_hybrid.py --tokens 2048 --source-tokens 128 --d-model 128 --heads 8 --window 128
+```
+
+This reports cumulative live activation memory after embedding, local attention, recurrence, source encoding, retrieval, cross-attention, copy, LM head, and backward, followed by separate inference/training ablations.
+
+For memory-minimal (but currently slower) exact cached prefill, process the
+hybrid prompt in blocks:
+
+```powershell
+.\.venv\Scripts\python.exe benchmark_attention.py --tokens 8192 16384 --attention-chunk-size 512 --prefill-chunk-size 512
+```
+
+`--prefill-chunk-size` is inference-only. It preserves causal outputs while
+bounding the local-attention and recurrent-scan working set to one block.
 
 ## Experimental results
 
@@ -122,6 +141,22 @@ On the 16-item synthetic corpus, 300 GPU steps, `d_model=64`, and one layer:
 | Full-attention pointer-reader, oracle evidence | 100% | 100% | 100% |
 
 The contextual bridge removes the reader failure: with correct evidence, the hybrid matches the full-attention baseline on this small task. With semantic retrieval, the remaining errors align with retrieval misses.
+
+### 8K/16K inference memory check
+
+After restricting copy/LM distributions to requested output positions and
+disabling autograd correctly during inference, the attention-only benchmark on
+the tested RTX 4050 produced:
+
+| Tokens | Full SDPA | Hybrid one-shot | Hybrid cached prefill |
+|---:|---:|---:|---:|
+| 8,192 | 20.56 ms / 36.4 MiB | 23.89 ms / 69.4 MiB | 232.54 ms / 27.0 MiB |
+| 16,384 | 69.06 ms / 64.4 MiB | 29.24 ms / 129.4 MiB | 413.45 ms / 41.8 MiB |
+
+One-shot hybrid stays within 100 MiB of full attention at both lengths and
+becomes faster at 16K. Cached prefill minimizes VRAM but has Python-level
+chunk-loop overhead; a fused FLA/Triton state backend is the path to improve
+that latency on Linux/WSL.
 
 ## Optional fused linear-attention backend
 

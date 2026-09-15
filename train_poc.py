@@ -98,14 +98,15 @@ def main(args: argparse.Namespace) -> None:
         input_ids, target_ids, input_mask, target_mask = _to_device(batch, device)
         prompt_tokens = tokenizer(example.prompt, return_tensors="pt")["input_ids"].shape[1]
         answer_mask = _answer_target_mask(target_mask, prompt_tokens)
+        answer_positions = answer_mask[0].nonzero(as_tuple=False).squeeze(-1)
         # Querying uses no answer tokens. Evidence lives outside the LM input.
         retrieved = evidence_for(example)
         memory = build_retrieved_memory(retrieved, tokenizer, model.embedding, batch_size=1, device=device)
         sources = prepare_contextual_copy_sources(memory, batch_size=1)
         optimizer.zero_grad(set_to_none=True)
         with amp():
-            logits = model(input_ids, token_mask=input_mask, retrieved_memory=memory.retrieved_memory, retrieved_mask=memory.retrieved_mask, source_states=sources.states, source_token_ids=sources.token_ids, source_mask=sources.mask, source_positions=sources.positions, source_document_ids=sources.document_ids)
-            loss = causal_cross_entropy(logits, target_ids, answer_mask)
+            logits = model(input_ids, token_mask=input_mask, retrieved_memory=memory.retrieved_memory, retrieved_mask=memory.retrieved_mask, source_states=sources.states, source_token_ids=sources.token_ids, source_mask=sources.mask, source_positions=sources.positions, source_document_ids=sources.document_ids, output_positions=answer_positions)
+            loss = causal_cross_entropy(logits, target_ids[:, answer_positions])
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
@@ -124,7 +125,7 @@ def main(args: argparse.Namespace) -> None:
             generated: list[torch.Tensor] = []
             for expected_token in expected:
                 input_mask = torch.ones_like(input_ids, dtype=torch.bool)
-                logits = model(input_ids, token_mask=input_mask, retrieved_memory=memory.retrieved_memory, retrieved_mask=memory.retrieved_mask, source_states=sources.states, source_token_ids=sources.token_ids, source_mask=sources.mask, source_positions=sources.positions, source_document_ids=sources.document_ids)
+                logits = model(input_ids, token_mask=input_mask, retrieved_memory=memory.retrieved_memory, retrieved_mask=memory.retrieved_mask, source_states=sources.states, source_token_ids=sources.token_ids, source_mask=sources.mask, source_positions=sources.positions, source_document_ids=sources.document_ids, output_positions=torch.tensor([-1], device=device))
                 predicted = logits[:, -1].argmax(dim=-1)
                 generated.append(predicted)
                 correct_tokens += int(predicted.item() == expected_token.item())
