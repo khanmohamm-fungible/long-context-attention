@@ -6,6 +6,7 @@ import torch
 from torch import Tensor, nn
 
 from App import HybridLongContextLayer, RMSNorm, SourceGroundedCopyHead
+from source_bridge import ContextualSourceEncoder
 
 
 class MiniHybridLM(nn.Module):
@@ -41,6 +42,7 @@ class MiniHybridLM(nn.Module):
         self.final_norm = RMSNorm(d_model)
         self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
         self.copy_head = SourceGroundedCopyHead(d_model, vocab_size, generator=self.lm_head)
+        self.source_encoder = ContextualSourceEncoder(d_model, num_heads)
 
     def forward(
         self,
@@ -52,6 +54,8 @@ class MiniHybridLM(nn.Module):
         source_states: Tensor | None = None,
         source_token_ids: Tensor | None = None,
         source_mask: Tensor | None = None,
+        source_positions: Tensor | None = None,
+        source_document_ids: Tensor | None = None,
     ) -> Tensor:
         x = self.embedding(input_ids)
         for layer in self.layers:
@@ -67,6 +71,10 @@ class MiniHybridLM(nn.Module):
         if any(item is not None for item in copy_inputs):
             if any(item is None for item in copy_inputs):
                 raise ValueError("source_states, source_token_ids, and source_mask must be supplied together")
+            if (source_positions is None) != (source_document_ids is None):
+                raise ValueError("source_positions and source_document_ids must be supplied together")
+            if source_positions is not None:
+                source_states = self.source_encoder(source_states, source_mask, source_positions, source_document_ids)
             return self.copy_head(hidden, source_states, source_token_ids, source_mask)
         return self.lm_head(hidden)
 

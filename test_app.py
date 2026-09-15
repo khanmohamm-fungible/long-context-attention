@@ -7,6 +7,7 @@ from App import (
     SlidingWindowAttention,
     SourceGroundedCopyHead,
 )
+from mini_hybrid_lm import make_next_token_batch
 
 
 def reference_attention(
@@ -48,6 +49,12 @@ def reference_attention(
 
 def main() -> None:
     torch.manual_seed(7)
+    shifted = make_next_token_batch(
+        torch.tensor([[11, 12, 13, 0]]),
+        torch.tensor([[1, 1, 1, 0]], dtype=torch.bool),
+    )
+    assert shifted.input_mask.tolist() == [[True, True, True]]
+    assert shifted.target_mask.tolist() == [[True, True, False]]
     x = torch.randn(2, 37, 32)
     attention = SlidingWindowAttention(32, 4, 8, 0.0).eval()
 
@@ -163,6 +170,17 @@ def main() -> None:
         output_positions=torch.tensor([-1]),
     )
     torch.testing.assert_close(selected_logits, logits[:, -1:])
+    shared_source_states = source_states[:, 0]
+    shared_source_ids = source_ids[:, 0]
+    shared_source_mask = source_mask[:, 0]
+    shared_logits = copy_head(x, shared_source_states, shared_source_ids, shared_source_mask)
+    expanded_shared_logits = copy_head(
+        x,
+        shared_source_states[:, None].expand(-1, x.shape[1], -1, -1),
+        shared_source_ids[:, None].expand(-1, x.shape[1], -1),
+        shared_source_mask[:, None].expand(-1, x.shape[1], -1),
+    )
+    torch.testing.assert_close(shared_logits, expanded_shared_logits)
 
     retrieval = RetrievedEvidenceAttention(32, query_chunk_size=7).eval()
     shared_memory = torch.randn(2, 5, 32)
@@ -186,3 +204,51 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+from sentence_transformers import SentenceTransformer
+import faiss
+import numpy as np
+
+embedder = SentenceTransformer(
+    "sentence-transformers/all-MiniLM-L6-v2"
+)
+
+documents = [
+    "Sudden braking can increase accident risk.",
+    "Sharp turns may cause a driver to lose control.",
+    "Nitrogen deficiency can cause yellow leaves.",
+    "Paris is the capital of France."
+]
+
+# Convert documents into vectors
+document_vectors = embedder.encode(documents)
+document_vectors = np.asarray(
+    document_vectors,
+    dtype="float32"
+)
+
+# Build the FAISS search index
+index = faiss.IndexFlatL2(
+    document_vectors.shape[1]
+)
+
+index.add(document_vectors)
+
+# Search for relevant documents
+query = "What can make driving dangerous?"
+
+query_vector = embedder.encode([query])
+query_vector = np.asarray(
+    query_vector,
+    dtype="float32"
+)
+
+distances, indices = index.search(
+    query_vector,
+    k=2
+)
+
+print("Relevant documents:")
+
+for i in indices[0]:
+    print("-", documents[i])

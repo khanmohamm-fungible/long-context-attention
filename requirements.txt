@@ -1,2 +1,8 @@
 torch
 numpy
+faiss-cpu
+sentence-transformers
+einops
+# Optional fused chunk-parallel state mixer. FLA's Triton CUDA runtime is not
+# currently packaged for native Windows; install this extra on CUDA/Linux.
+flash-linear-attention[cuda]; platform_system != "Windows"

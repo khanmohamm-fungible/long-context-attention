@@ -9,8 +9,9 @@ The current PyTorch scan fallback is O(N log N) work (sub-quadratic), not
 O(N). Replace it with an associative-scan CUDA/Triton kernel for true O(N)
 work when profiling shows it is a bottleneck.
 """
-
 from __future__ import annotations
+from retrieval import RetrievedDocument, SQLiteFTSRetriever
+
 
 import json
 import re
@@ -50,16 +51,6 @@ class HybridCache:
 
     def detach(self) -> "HybridCache":
         return HybridCache(self.state.detach(), self.local_kv.detach())
-
-
-@dataclass(frozen=True)
-class RetrievedDocument:
-    """Raw, attributable evidence returned by the lexical index."""
-
-    document_id: str
-    text: str
-    score: float
-    metadata: dict[str, object]
 
 
 class RMSNorm(nn.Module):
@@ -190,6 +181,55 @@ class ParallelGatedStateMixer(nn.Module):
         if mask is not None:
             mixed = mixed * mask
         return mixed, final_state
+
+
+class FlashLinearStateMixer(nn.Module):
+    """Optional FLA Gated Linear Attention backend.
+
+    FLA supplies chunk-parallel CUDA kernels for training, which is the only
+    supported route in this project that can plausibly compete with Flash
+    Attention at very long contexts.  It is intentionally optional: the FLA
+    Triton backend is not distributed for native Windows at the time of
+    writing.  Use this backend on a supported CUDA/Linux environment; the
+    PyTorch mixer above remains the portable correctness fallback.
+    """
+
+    def __init__(self, d_model: int, num_heads: int) -> None:
+        super().__init__()
+        try:
+            from fla.layers import GatedLinearAttention
+        except ImportError as error:
+            raise ImportError(
+                "FLA backend requires flash-linear-attention[cuda] and its "
+                "Triton CUDA runtime. Use state_backend='torch' on Windows."
+            ) from error
+        self.mixer = GatedLinearAttention(
+            mode="chunk",
+            hidden_size=d_model,
+            num_heads=num_heads,
+            use_short_conv=True,
+            conv_size=4,
+            fuse_norm=True,
+        )
+
+    def forward(
+        self,
+        x: Tensor,
+        *,
+        bidirectional: bool,
+        initial_state: Tensor | None,
+        token_mask: Tensor | None = None,
+    ) -> tuple[Tensor, Tensor]:
+        if bidirectional or initial_state is not None:
+            raise ValueError("the FLA state mixer supports causal training only and manages its own cache")
+        output, _, _ = self.mixer(
+            x,
+            attention_mask=token_mask,
+            use_cache=False,
+        )
+        # The FLA recurrent cache is opaque and is deliberately not exposed
+        # through HybridCache. It is not needed for full-sequence training.
+        return output, x.new_zeros(x.shape[0], x.shape[-1])
 
 
 class SlidingWindowAttention(nn.Module):
@@ -550,53 +590,6 @@ class BruteForceTopKRetriever(nn.Module):
         return evidence, valid
 
 
-class SQLiteFTSRetriever:
-    """Persistent lexical retrieval with raw text and provenance.
-
-    SQLite FTS5 is a real, dependency-free retrieval backend suitable for a
-    demo or a small private corpus. It performs exact lexical matching, unlike
-    the vector-only demo retriever. For a large corpus, keep this API and swap
-    the implementation for a managed BM25/ANN service plus a reranker.
-    """
-
-    def __init__(self, database_path: str | Path) -> None:
-        path = Path(database_path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        self.connection = sqlite3.connect(path)
-        self.connection.execute("PRAGMA journal_mode=WAL")
-        self.connection.execute("CREATE TABLE IF NOT EXISTS documents (document_id TEXT PRIMARY KEY, text TEXT NOT NULL, metadata_json TEXT NOT NULL)")
-        self.connection.execute("CREATE VIRTUAL TABLE IF NOT EXISTS documents_fts USING fts5(document_id UNINDEXED, text, tokenize='unicode61')")
-
-    def close(self) -> None:
-        self.connection.close()
-
-    def upsert(self, document_id: str, text: str, metadata: dict[str, object] | None = None) -> None:
-        if not document_id or not text:
-            raise ValueError("document_id and text must be non-empty")
-        metadata_json = json.dumps(metadata or {}, sort_keys=True)
-        with self.connection:
-            self.connection.execute("DELETE FROM documents_fts WHERE document_id = ?", (document_id,))
-            self.connection.execute("DELETE FROM documents WHERE document_id = ?", (document_id,))
-            self.connection.execute("INSERT INTO documents(document_id, text, metadata_json) VALUES (?, ?, ?)", (document_id, text, metadata_json))
-            self.connection.execute("INSERT INTO documents_fts(document_id, text) VALUES (?, ?)", (document_id, text))
-
-    def search(self, query: str, top_k: int = 4) -> list[RetrievedDocument]:
-        if top_k <= 0:
-            raise ValueError("top_k must be positive")
-        # Quote individual terms so ordinary user punctuation cannot alter FTS
-        # query syntax. This is lexical retrieval, not semantic retrieval.
-        terms = re.findall(r"\w+", query, flags=re.UNICODE)
-        if not terms:
-            return []
-        fts_query = " AND ".join(f'"{term}"' for term in terms)
-        rows = self.connection.execute(
-            "SELECT d.document_id, d.text, d.metadata_json, bm25(documents_fts) "
-            "FROM documents_fts JOIN documents d USING(document_id) "
-            "WHERE documents_fts MATCH ? ORDER BY bm25(documents_fts) LIMIT ?",
-            (fts_query, top_k),
-        ).fetchall()
-        return [RetrievedDocument(row[0], row[1], float(row[3]), json.loads(row[2])) for row in rows]
-
 
 class SourceGroundedCopyHead(nn.Module):
     """Mix vocabulary logits with an exact pointer distribution over source IDs.
@@ -606,12 +599,12 @@ class SourceGroundedCopyHead(nn.Module):
     and can be decoded back to user-visible text with its document provenance.
     """
 
-    def __init__(self, d_model: int, vocab_size: int) -> None:
+    def __init__(self, d_model: int, vocab_size: int, *, generator: nn.Linear | None = None) -> None:
         super().__init__()
         if vocab_size <= 0:
             raise ValueError("vocab_size must be positive")
         self.vocab_size = vocab_size
-        self.generator = nn.Linear(d_model, vocab_size)
+        self.generator = generator if generator is not None else nn.Linear(d_model, vocab_size)
         self.query = nn.Linear(d_model, d_model, bias=False)
         self.key = nn.Linear(d_model, d_model, bias=False)
         self.copy_gate = nn.Linear(d_model, 1)
@@ -626,9 +619,13 @@ class SourceGroundedCopyHead(nn.Module):
         *,
         output_positions: Tensor | None = None,
     ) -> Tensor:
-        if source_states.ndim != 4 or source_states.shape[:2] != hidden.shape[:2] or source_states.shape[-1] != hidden.shape[-1]:
+        shared_sources = source_states.ndim == 3
+        if shared_sources:
+            if source_states.shape[0] != hidden.shape[0] or source_states.shape[-1] != hidden.shape[-1]:
+                raise ValueError("shared source_states must be [batch, source_tokens, d_model]")
+        elif source_states.ndim != 4 or source_states.shape[:2] != hidden.shape[:2] or source_states.shape[-1] != hidden.shape[-1]:
             raise ValueError("source_states must be [batch, tokens, source_tokens, d_model]")
-        if source_states.shape[2] == 0:
+        if source_states.shape[-2] == 0:
             raise ValueError("source_states must contain at least one source token")
         if source_token_ids.shape != source_states.shape[:-1] or source_mask.shape != source_token_ids.shape:
             raise ValueError("source token IDs and mask must match source_states")
@@ -650,22 +647,20 @@ class SourceGroundedCopyHead(nn.Module):
             ):
                 raise ValueError("output_positions contains an invalid token index")
             hidden = hidden.index_select(1, output_positions)
-            source_states = source_states.index_select(
-                1,
-                output_positions.to(source_states.device),
-            )
-            source_token_ids = source_token_ids.index_select(
-                1,
-                output_positions.to(source_token_ids.device),
-            )
-            source_mask = source_mask.index_select(
-                1,
-                output_positions.to(source_mask.device),
-            )
+            if not shared_sources:
+                source_states = source_states.index_select(1, output_positions.to(source_states.device))
+                source_token_ids = source_token_ids.index_select(1, output_positions.to(source_token_ids.device))
+                source_mask = source_mask.index_select(1, output_positions.to(source_mask.device))
         source_token_ids = source_token_ids.to(device=hidden.device, dtype=torch.long)
         source_states = source_states.to(hidden)
         source_mask = source_mask.to(device=hidden.device, dtype=torch.bool)
-        scores = (self.query(hidden).unsqueeze(2) * self.key(source_states)).sum(-1) * self.scale
+        if shared_sources:
+            scores = self.query(hidden) @ self.key(source_states).transpose(-1, -2)
+            source_mask = source_mask[:, None]
+            source_token_ids = source_token_ids[:, None].expand(-1, hidden.shape[1], -1)
+        else:
+            scores = (self.query(hidden).unsqueeze(2) * self.key(source_states)).sum(-1)
+        scores = scores * self.scale
         weights = torch.softmax(scores.masked_fill(~source_mask, torch.finfo(scores.dtype).min), dim=-1)
         weights = weights * source_mask.to(weights.dtype)
         weights = weights / weights.sum(-1, keepdim=True).clamp_min(torch.finfo(weights.dtype).eps)
@@ -685,15 +680,22 @@ class HybridLongContextLayer(nn.Module):
     to avoid replicating it for every query.
     """
 
-    def __init__(self, d_model: int, window_size: int = 128, *, num_heads: int = 8, dropout: float = 0.0, mlp_ratio: int = 4, use_fused_scan: bool = False) -> None:
+    def __init__(self, d_model: int, window_size: int = 128, *, num_heads: int = 8, dropout: float = 0.0, mlp_ratio: int = 4, use_fused_scan: bool = False, state_backend: str = "torch", use_local_attention: bool = True) -> None:
         super().__init__()
         if d_model <= 0 or mlp_ratio <= 0:
             raise ValueError("d_model and mlp_ratio must be positive")
+        if state_backend not in {"torch", "fla"}:
+            raise ValueError("state_backend must be 'torch' or 'fla'")
         self.d_model, self.window_size = d_model, window_size
+        self.state_backend, self.use_local_attention = state_backend, use_local_attention
         self.local_norm, self.state_norm = RMSNorm(d_model), RMSNorm(d_model)
         self.retrieval_norm, self.mlp_norm = RMSNorm(d_model), RMSNorm(d_model)
         self.local_attention = SlidingWindowAttention(d_model, num_heads, window_size, dropout)
-        self.state_mixer = ParallelGatedStateMixer(d_model, use_fused_scan=use_fused_scan)
+        self.state_mixer = (
+            ParallelGatedStateMixer(d_model, use_fused_scan=use_fused_scan)
+            if state_backend == "torch"
+            else FlashLinearStateMixer(d_model, num_heads)
+        )
         self.retrieval = RetrievedEvidenceAttention(d_model)
         self.mlp = nn.Sequential(nn.Linear(d_model, mlp_ratio * d_model), nn.GELU(), nn.Linear(mlp_ratio * d_model, d_model))
 
@@ -722,14 +724,19 @@ class HybridLongContextLayer(nn.Module):
             state, kv_cache = cache.state, cache.local_kv
         if not causal and (kv_cache is not None or cache is not None):
             raise ValueError("KV caching is available only for causal inference")
-        local, next_kv = self.local_attention(
-            self.local_norm(x),
-            causal=causal,
-            position_ids=position_ids,
-            kv_cache=kv_cache,
-            token_mask=token_mask,
-        )
-        x = x + local
+        if self.use_local_attention:
+            local, next_kv = self.local_attention(
+                self.local_norm(x),
+                causal=causal,
+                position_ids=position_ids,
+                kv_cache=kv_cache,
+                token_mask=token_mask,
+            )
+            x = x + local
+        else:
+            if kv_cache is not None:
+                raise ValueError("KV caching requires use_local_attention=True")
+            next_kv = None
         mixed, final_state = self.state_mixer(
             self.state_norm(x),
             bidirectional=not causal,
@@ -746,6 +753,8 @@ class HybridLongContextLayer(nn.Module):
                 dtype=output.dtype,
             ).unsqueeze(-1)
         if return_cache:
+            if self.state_backend == "fla":
+                raise ValueError("FLA cache support is not exposed by HybridCache yet")
             if not causal or next_kv is None:
                 raise ValueError("return_cache requires causal=True")
             return output, HybridCache(final_state, next_kv)
