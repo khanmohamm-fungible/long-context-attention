@@ -46,6 +46,7 @@ Input text → GPT-2 tokenizer → token embeddings
 | `train_poc.py` | GPU-only hybrid retrieval/copy training and evaluation. |
 | `full_copy_baseline.py` | Full-attention pointer-reader baseline. |
 | `benchmark_attention.py` | CUDA latency and peak-VRAM benchmark. |
+| `profile_hybrid.py` | Per-component activation-memory profile and ablations. |
 | `test_app.py` | Reference, cache, padding, and copy-path tests. |
 
 ## Requirements
@@ -105,6 +106,7 @@ Compare local attention, full PyTorch SDPA, and the complete hybrid layer:
 .\.venv\Scripts\python.exe benchmark_attention.py --tokens 1024 2048 4096 8192
 .\.venv\Scripts\python.exe benchmark_attention.py --training --tokens 4096 8192
 .\.venv\Scripts\python.exe benchmark_attention.py --tokens 8192 16384 --attention-chunk-size 512
+.\.venv\Scripts\python.exe benchmark_attention.py --tokens 32768 --attention-chunk-size 512 --prefill-chunk-size 4096 --repeats 5 --warmup 2
 ```
 
 The benchmark uses synchronized CUDA timing and `torch.cuda.max_memory_allocated`, reporting GPU latency and allocated VRAM rather than CPU RSS. PyTorch SDPA may select Flash Attention on supported hardware.
@@ -117,15 +119,17 @@ Profile every hybrid stage and run retrieval/copy ablations:
 
 This reports cumulative live activation memory after embedding, local attention, recurrence, source encoding, retrieval, cross-attention, copy, LM head, and backward, followed by separate inference/training ablations.
 
-For memory-minimal (but currently slower) exact cached prefill, process the
-hybrid prompt in blocks:
+For exact, low-VRAM cached prefill, process the hybrid prompt in 4K blocks:
 
 ```powershell
-.\.venv\Scripts\python.exe benchmark_attention.py --tokens 8192 16384 --attention-chunk-size 512 --prefill-chunk-size 512
+.\.venv\Scripts\python.exe benchmark_attention.py --tokens 8192 16384 --attention-chunk-size 512 --prefill-chunk-size 4096 --repeats 8 --warmup 3
 ```
 
 `--prefill-chunk-size` is inference-only. It preserves causal outputs while
 bounding the local-attention and recurrent-scan working set to one block.
+`MiniHybridLM` automatically selects the same 4,096-token cached-prefill path
+for inference prompts longer than 4,096 tokens; pass
+`inference_prefill_chunk_size=None` at construction time to disable it.
 
 ## Experimental results
 
@@ -144,19 +148,44 @@ The contextual bridge removes the reader failure: with correct evidence, the hyb
 
 ### 8K/16K inference memory check
 
-After restricting copy/LM distributions to requested output positions and
-disabling autograd correctly during inference, the attention-only benchmark on
-the tested RTX 4050 produced:
+The copy head and output projection now emit vocabulary distributions only for
+requested positions: answer-token positions during training and the final
+position during autoregressive decoding. At 2K tokens with the GPT-2
+vocabulary, this reduced copy-plus-output live allocation from about **2.08
+GiB to 116 MiB**, and backward peak from **3.65 GiB to 199 MiB**.
+
+With autograd disabled correctly during inference, the attention-only benchmark
+on the tested RTX 4050 produced:
 
 | Tokens | Full SDPA | Hybrid one-shot | Hybrid cached prefill |
 |---:|---:|---:|---:|
-| 8,192 | 20.56 ms / 36.4 MiB | 23.89 ms / 69.4 MiB | 232.54 ms / 27.0 MiB |
-| 16,384 | 69.06 ms / 64.4 MiB | 29.24 ms / 129.4 MiB | 413.45 ms / 41.8 MiB |
+| 8,192 | 20.48 ms / 36.4 MiB | 23.89 ms / 69.4 MiB | — |
+| 16,384 | 64.36 ms / 64.4 MiB | 29.24 ms / 129.4 MiB | 41.21 ms / 59.8 MiB |
 
 One-shot hybrid stays within 100 MiB of full attention at both lengths and
-becomes faster at 16K. Cached prefill minimizes VRAM but has Python-level
-chunk-loop overhead; a fused FLA/Triton state backend is the path to improve
-that latency on Linux/WSL.
+becomes faster at 16K. The 4K cached-prefill path is exact, retains less VRAM
+than full SDPA at 16K, and remains faster than full SDPA in the stable
+multi-repeat test. A fused FLA/Triton state backend is still the path to reduce
+kernel-launch overhead further on Linux/WSL.
+
+## Research status
+
+This repository is suitable as the foundation for a technical report,
+hackathon paper, or workshop/student-project submission. A defensible framing
+is a hybrid long-context architecture with contextual retrieval copying and
+memory-aware output/prefill optimizations.
+
+The current evidence supports the following narrow claims:
+
+- Contextualized retrieved source tokens are necessary for reliable exact
+  copying in the provided controlled task.
+- Output-position selection eliminates the dominant vocabulary-space memory
+  allocation in the original copy path.
+- At the tested small width, cached hybrid prefill can use less VRAM than full
+  SDPA at 16K tokens while preserving exact causal outputs.
+
+It does **not** yet establish general language-model quality or a universal
+speed advantage over Flash Attention.
 
 ## Optional fused linear-attention backend
 
@@ -176,7 +205,7 @@ FLA is not currently usable from the native Windows environment used for this pr
 - Full attention is often faster at short and moderate sequence lengths due to optimized Flash Attention kernels.
 - Retrieval currently runs through CPU FAISS and Sentence Transformers; it is outside the GPU layer timing benchmark.
 - A rigorous long-context study should compare parameter-matched full, sliding-only, hybrid, and hybrid-plus-retrieval models across context lengths, corpora, random seeds, and equal training-token budgets.
+- A paper-quality evaluation needs larger standard long-context and retrieval
+  benchmarks, multiple random seeds/confidence intervals, and results at
+  larger model widths and depths.
 
-## License
-
-No license file is currently included. Add one before distributing or accepting external contributions.
