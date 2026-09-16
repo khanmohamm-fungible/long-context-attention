@@ -196,7 +196,63 @@ The current evidence supports the following narrow claims:
 
 It does **not** yet establish general language-model quality or a universal
 speed advantage over Flash Attention.
+
+### Reproducible multi-model study
+
+`long_context_study.py` is the controlled study harness. It instantiates the
+same parameter tensors for every variant, routes them as full, sliding-only,
+hybrid, or hybrid-plus-retrieval, and gives every condition the same training
+token budget. It exports one CSV row per context length, corpus, seed, and
+variant, including parameter count, final loss, held-out accuracy, training
+time, and peak CUDA memory.
+
+The two included corpora are deliberately diagnostic:
+
+- `needle`: a unique marker appears at a random, potentially distant position;
+  the final query marker asks for the token immediately following it;
+- `retrieval`: the target is absent from the prompt and appears only in an
+  external source. A real CPU FAISS `IndexFlatIP` lookup retrieves document IDs
+  and reports recall@1/recall@k separately from reader accuracy.
+
+The full-attention baseline now uses RoPE, matching the positional information
+available to sliding attention. Retrieval CSV rows include
+`retrieval_recall_at_1` and `retrieval_recall_at_k`.
+
+Run a pilot:
+
+```powershell
+.\.venv\Scripts\python.exe long_context_study.py --tokens 256 1024 --seeds 7 19 --train-tokens 32768 --eval-batches 16 --batch-size 4 --d-model 64 --layers 1 --heads 4 --window 64 --bf16 --output study_pilot.csv
+```
+
+For the full local study, use three seeds and a substantially larger fixed
+token budget. This takes longer but avoids giving longer contexts fewer
+optimizer updates than shorter ones:
+
+```powershell
+.\.venv\Scripts\python.exe long_context_study.py --tokens 256 512 1024 2048 --seeds 7 19 41 --train-tokens 524288 --eval-batches 64 --batch-size 4 --d-model 128 --layers 2 --heads 4 --window 64 --bf16 --output study_full.csv
+```
+
+The included pilot validated equal parameter counts (197,249 in every
+condition) and showed expected retrieval behavior. It is not a final result:
+at a 32,768-token budget, the 1,024-token setting makes only eight optimizer
+updates, which is insufficient for the needle task.
 Further testing is still necessary to establish trusted claims.
+
+### Cached-prefill scaling check
+
+```powershell
+.\.venv\Scripts\python.exe benchmark_attention.py --tokens 4096 8192 16384 --attention-chunk-size 512 --prefill-chunk-size 4096 --repeats 5 --warmup 2
+```
+
+| Tokens | Full SDPA | Hybrid cached prefill |
+|---:|---:|---:|
+| 4,096 | 6.10 ms / 22.4 MiB | 43.51 ms / 39.5 MiB |
+| 8,192 | 20.90 ms / 36.4 MiB | 75.42 ms / 47.7 MiB |
+| 16,384 | 61.23 ms / 64.4 MiB | 156.37 ms / 59.8 MiB |
+
+Cached prefill protects VRAM at longer lengths, but the current native-Windows
+implementation has Python-level cache-loop overhead. Treat it as a
+memory-constrained inference option, not the low-latency default.
 
 ## Optional fused linear-attention backend
 
@@ -206,8 +262,31 @@ Further testing is still necessary to establish trusted claims.
 pip install 'flash-linear-attention[cuda]'
 python train_poc.py --state-backend fla --no-local-attention
 ```
-It is a fallback and not recommmeded.
 FLA is not currently usable from the native Windows environment used for this project because its required Triton runtime does not ship a compatible Windows wheel. The default `torch` state mixer is a portable correctness baseline.
+
+To enable the existing FLA backend, install WSL2/Ubuntu from an **Administrator
+PowerShell** (a system change that generally needs a restart), then install the
+CUDA dependencies inside Ubuntu:
+
+```powershell
+wsl --install -d Ubuntu
+```
+
+```bash
+# Run inside Ubuntu after the WSL installation/restart.
+cd /mnt/c/Users/Hannah/Desktop/ABBA_HACKATHON/long-context-attention
+python3 -m venv .venv-linux
+source .venv-linux/bin/activate
+pip install --upgrade pip
+pip install torch --index-url https://download.pytorch.org/whl/cu126
+pip install -r requirements.txt
+pip install 'flash-linear-attention[cuda]'
+python train_poc.py --state-backend fla --no-local-attention
+```
+
+The FLA path replaces the portable training-state scan with chunk-parallel
+Gated Linear Attention kernels. Validate CUDA and benchmark it before using it
+for study results.
 
 ## Limitations and next steps
 
@@ -218,4 +297,3 @@ FLA is not currently usable from the native Windows environment used for this pr
 - A paper-quality evaluation needs larger standard long-context and retrieval
   benchmarks, multiple random seeds/confidence intervals, and results at
   larger model widths and depths.
-

@@ -1,0 +1,9 @@
+variant,corpus,seed,tokens,train_tokens,steps,parameters,final_loss,accuracy,retrieval_recall_at_1,retrieval_recall_at_k,train_seconds,peak_train_mib
+full,needle,7,128,4096,16,197249,5.640625,0.0,,,2.686,18.812
+sliding,needle,7,128,4096,16,197249,5.625,0.0,,,0.967,18.874
+hybrid,needle,7,128,4096,16,197249,5.765625,0.0,,,1.164,20.183
+hybrid_retrieval,needle,7,128,4096,16,197249,5.765625,0.0,,,1.151,20.183
+full,retrieval,7,128,4096,16,197249,4.9375,0.0,1.0,1.0,0.986,18.812
+sliding,retrieval,7,128,4096,16,197249,5.140625,0.0,1.0,1.0,0.684,18.875
+hybrid,retrieval,7,128,4096,16,197249,5.140625,0.0,1.0,1.0,1.204,20.184
+hybrid_retrieval,retrieval,7,128,4096,16,197249,2.229451,1.0,1.0,1.0,1.942,20.773
